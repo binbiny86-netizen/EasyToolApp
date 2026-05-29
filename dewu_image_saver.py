@@ -4,10 +4,13 @@ import os
 import queue
 import re
 import threading
+import time
 import urllib.request
 import base64
 import gzip
 import zlib
+import posixpath
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -55,8 +58,15 @@ PRODUCT_DEBUG_DIR = OUTPUT_ROOT / "product_debug"
 JPEG_QUALITY = _int_env("DEWU_JPEG_QUALITY", 95, 1, 100)
 OUTPUT_FORMAT = "JPEG"
 OUTPUT_EXT = ".jpg"
-SCRIPT_VERSION = "2026-05-28-product-media-v5"
+SCRIPT_VERSION = "2026-05-29-product-media-v6"
 PRODUCT_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+JSON_DOWNLOAD_WORKERS = _int_env("DEWU_JSON_DOWNLOAD_WORKERS", 6, 1, 24)
+MAX_JSON_IMAGE_URLS = _int_env("DEWU_MAX_JSON_IMAGES", 0, 0, 5000)
+MAX_JSON_VIDEO_GROUPS = _int_env("DEWU_MAX_JSON_VIDEOS", 0, 0, 2000)
+JSON_DOWNLOAD_EXECUTOR = ThreadPoolExecutor(
+    max_workers=JSON_DOWNLOAD_WORKERS,
+    thread_name_prefix="dewu-json-download",
+)
 
 DEFAULT_HOST_KEYWORDS = "dewu,poizon,shihuo,dewucdn,dewuimg,aliyuncs"
 DEWU_HOST_KEYWORDS = {
@@ -97,6 +107,7 @@ IMAGE_EXTENSIONS = {
 SKIP_IMAGE_PATH_TOKENS = {"favicon.ico", "captcha", "blank.png"}
 JSON_URL_RE = re.compile(r"https?:\\?/\\?/[^\s\"'<>]+", re.IGNORECASE)
 downloaded_json_urls = set()
+downloaded_json_urls_lock = threading.Lock()
 downloaded_video_keys = set()
 downloaded_video_keys_lock = threading.Lock()
 
@@ -125,6 +136,13 @@ JSON_SKIP_URL_TOKENS = (
     ".mp3",
     ".zip",
     "captcha",
+)
+
+VIDEO_SKIP_URL_TOKENS = (
+    "/duapp/android_config/resource/",
+    "/du_rn/",
+    "/bundle/",
+    "test-mall-apk",
 )
 
 PRODUCT_IMAGE_URL_TOKENS = (
@@ -190,6 +208,54 @@ def _stdout_log_worker():
 threading.Thread(target=_stdout_log_worker, daemon=True).start()
 
 
+def submit_download_task(target, *args):
+    JSON_DOWNLOAD_EXECUTOR.submit(download_task_guard, target, *args)
+
+
+def download_task_guard(target, *args):
+    try:
+        target(*args)
+    except Exception as error:
+        log_event("download_task_failed", target=getattr(target, "__name__", str(target)), error=str(error))
+
+
+def limited_items(items: list[str], max_count: int) -> list[str]:
+    if max_count <= 0:
+        return items
+    return items[:max_count]
+
+
+def forwarded_request_headers(flow: http.HTTPFlow, accept: str) -> dict[str, str]:
+    headers = {
+        "User-Agent": flow.request.headers.get("user-agent", "Mozilla/5.0"),
+        "Accept": accept,
+        "Connection": "close",
+    }
+    for name in (
+        "accept-language",
+        "cookie",
+        "referer",
+        "origin",
+        "x-requested-with",
+    ):
+        value = flow.request.headers.get(name)
+        if value:
+            headers[name.title()] = value
+    return headers
+
+
+def open_url_with_retries(request: urllib.request.Request, timeout: int, attempts: int = 3):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except Exception as error:
+            last_error = error
+            if attempt < attempts:
+                time.sleep(0.4 * attempt)
+    raise last_error
+
+
 def log_event(event: str, **fields):
     payload = {"event": event, **fields}
     line = json.dumps(payload, ensure_ascii=False)
@@ -250,6 +316,11 @@ def should_skip_json_url(url: str) -> bool:
     return should_skip_image_url(url) or any(token in lower for token in JSON_SKIP_URL_TOKENS)
 
 
+def should_skip_video_url(url: str) -> bool:
+    lower = url.lower().split("?")[0]
+    return any(token in lower for token in VIDEO_SKIP_URL_TOKENS)
+
+
 def is_product_image_url(url: str) -> bool:
     lower = url.lower()
     return any(token in lower for token in PRODUCT_IMAGE_URL_TOKENS)
@@ -278,12 +349,67 @@ def restore_video_url_from_snapshot(url: str) -> str | None:
 
 
 def canonical_video_key(url: str) -> str:
+    semantic_id = semantic_video_id(url)
+    if semantic_id:
+        return f"video:{semantic_id}"
     restored = restore_video_url_from_snapshot(url) or url
     parsed = urlsplit(restored)
     path = parsed.path.lower()
     if path:
         return path
     return restored.split("?")[0].lower()
+
+
+def semantic_video_id(url: str) -> str | None:
+    restored = restore_video_url_from_snapshot(url) or url
+    path = unquote(urlsplit(restored).path).lower()
+    filename = posixpath.basename(path)
+    stem = re.sub(r"\.[a-z0-9]+$", "", filename)
+    stem = re.sub(r"^watermark_[0-9a-f-]{16,}_", "", stem)
+    stem = re.sub(r"^(?:e_)?_?dur\d+dur_", "", stem)
+    stem = re.sub(r"^\d+dur_", "", stem)
+    stem = re.sub(r"_(?:du_)?(?:android|ios)_w\d+h\d+$", "", stem)
+    stem = re.sub(r"_w\d+h\d+$", "", stem)
+    stem = stem.strip("_")
+
+    if re.search(r"[0-9a-f]{16,}", stem):
+        return stem
+    return None
+
+
+def video_candidate_score(url: str) -> int:
+    lower = url.lower()
+    score = 0
+    for match in re.findall(r"(?:^|[_/])(?:e_)?_?dur(\d+)dur|[_/](\d+)dur_", lower):
+        value = next((item for item in match if item), "0")
+        try:
+            score += min(int(value), 300000) // 100
+        except ValueError:
+            pass
+    for width, height in re.findall(r"w(\d+)h(\d+)", lower):
+        try:
+            score += (int(width) * int(height)) // 1000
+        except ValueError:
+            pass
+    if "4k" in lower:
+        score += 4000
+    if "2k" in lower:
+        score += 2200
+    if "1080p" in lower:
+        score += 1200
+    if "720p" in lower:
+        score += 400
+    if "60fps" in lower:
+        score += 600
+    if "enh" in lower:
+        score += 250
+    if "watermark" in lower or "/algorithm/wm/" in lower:
+        score -= 5000
+    if "dw264_720p" in lower:
+        score -= 300
+    if should_skip_video_url(url):
+        score -= 20000
+    return score
 
 
 def is_image_response(flow: http.HTTPFlow) -> bool:
@@ -385,11 +511,15 @@ def save_image(flow: http.HTTPFlow):
     )
     restored_video_url = restore_video_url_from_snapshot(flow.request.url)
     if restored_video_url:
-        threading.Thread(
-            target=save_json_embedded_video,
-            args=(restored_video_url, flow.request.url),
-            daemon=True,
-        ).start()
+        submit_download_task(
+            save_json_embedded_video_candidates,
+            [restored_video_url],
+            flow.request.url,
+            forwarded_request_headers(
+                flow,
+                "video/*,application/vnd.apple.mpegurl,application/x-mpegurl,*/*;q=0.8",
+            ),
+        )
     save_image_bytes(flow.response.content, flow.request.url, "response")
 
 
@@ -408,7 +538,12 @@ def extract_video_urls_from_text(text: str) -> list[str]:
     normalized = text.replace("\\/", "/")
     for match in JSON_URL_RE.finditer(normalized):
         url = unquote(match.group(0).rstrip("\\,.;)}]"))
-        if is_dewu_request(url) and not should_skip_json_url(url) and is_video_url(url):
+        if (
+            is_dewu_request(url)
+            and not should_skip_json_url(url)
+            and not should_skip_video_url(url)
+            and is_video_url(url)
+        ):
             urls.add(restore_video_url_from_snapshot(url) or url)
     return sorted(urls)
 
@@ -540,20 +675,22 @@ def dump_product_response(flow: http.HTTPFlow, text: str):
         log_event("product_response_dump_failed", error=str(error), url=flow.request.url)
 
 
-def save_json_embedded_image(url: str, source_url: str):
-    if url in downloaded_json_urls:
-        log_event("json_image_duplicate_url", url=url)
-        return
-    downloaded_json_urls.add(url)
+def save_json_embedded_image(url: str, source_url: str, request_headers: dict[str, str]):
+    with downloaded_json_urls_lock:
+        if url in downloaded_json_urls:
+            log_event("json_image_duplicate_url", url=url)
+            return
+        downloaded_json_urls.add(url)
     try:
         request = urllib.request.Request(
             url,
-            headers={
+            headers=request_headers
+            or {
                 "User-Agent": "Mozilla/5.0",
                 "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
             },
         )
-        with urllib.request.urlopen(request, timeout=12) as response:
+        with open_url_with_retries(request, timeout=20, attempts=3) as response:
             content_type = response.headers.get("content-type", "")
             raw = response.read()
         if not content_type.lower().startswith("image/"):
@@ -575,6 +712,8 @@ def save_json_embedded_image(url: str, source_url: str):
         save_image_bytes(raw, url, "product_json" if is_product_api_url(source_url) else "json")
     except Exception as error:
         log_event("json_image_failed", error=str(error), url=url, source_url=source_url)
+        with downloaded_json_urls_lock:
+            downloaded_json_urls.discard(url)
 
 
 def video_extension_from_url(url: str, content_type: str) -> str:
@@ -606,16 +745,27 @@ def save_video_bytes(raw_bytes: bytes, source_url: str, source: str, content_typ
     temp_path = VIDEO_DIR / f"{filename}.{os.getpid()}.{threading.get_ident()}.downloading"
 
     if filepath.exists():
+        existing_bytes = filepath.stat().st_size
+        if len(raw_bytes) <= existing_bytes:
+            log_event(
+                "video_duplicate",
+                file=filename,
+                url_hash=url_hash,
+                source=source,
+                existing_bytes=existing_bytes,
+                bytes=len(raw_bytes),
+                key=storage_key,
+            )
+            return
         log_event(
-            "video_duplicate",
+            "video_replacing_smaller",
             file=filename,
             url_hash=url_hash,
             source=source,
-            existing_bytes=filepath.stat().st_size,
+            existing_bytes=existing_bytes,
             bytes=len(raw_bytes),
             key=storage_key,
         )
-        return
 
     try:
         with open(temp_path, "wb") as file:
@@ -657,18 +807,22 @@ def is_partial_video_response(status_code: int, headers, body_size: int) -> bool
     return status_code == 206 or (total is not None and body_size < total)
 
 
-def download_video_url(url: str, source_url: str, source: str):
+def download_video_url(url: str, source_url: str, source: str, request_headers: dict[str, str] | None = None):
     url = restore_video_url_from_snapshot(url) or url
+    if should_skip_video_url(url):
+        log_event("json_video_skipped", reason="skip_token", url=url, source_url=source_url)
+        return False
     try:
         request = urllib.request.Request(
             url,
-            headers={
+            headers=request_headers
+            or {
                 "User-Agent": "Mozilla/5.0",
                 "Accept": "video/*,application/vnd.apple.mpegurl,application/x-mpegurl,*/*;q=0.8",
                 "Connection": "close",
             },
         )
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with open_url_with_retries(request, timeout=120, attempts=3) as response:
             content_type = response.headers.get("content-type", "")
             content_range = response.headers.get("content-range", "")
             raw = response.read()
@@ -718,21 +872,56 @@ def download_video_url(url: str, source_url: str, source: str):
         return False
 
 
-def download_claimed_video_url(url: str, source_url: str, source: str, key: str):
-    if download_video_url(url, source_url, source):
+def download_claimed_video_url(
+    url: str,
+    source_url: str,
+    source: str,
+    key: str,
+    request_headers: dict[str, str] | None = None,
+):
+    if download_video_url(url, source_url, source, request_headers):
         return
     with downloaded_video_keys_lock:
         downloaded_video_keys.discard(key)
 
 
-def save_json_embedded_video(url: str, source_url: str):
-    key = canonical_video_key(url)
+def save_json_embedded_video_candidates(
+    candidates: list[str],
+    source_url: str,
+    request_headers: dict[str, str] | None = None,
+):
+    candidates = sorted(
+        {restore_video_url_from_snapshot(url) or url for url in candidates if not should_skip_video_url(url)},
+        key=video_candidate_score,
+        reverse=True,
+    )
+    if not candidates:
+        return
+
+    key = canonical_video_key(candidates[0])
     with downloaded_video_keys_lock:
         if key in downloaded_video_keys:
-            log_event("json_video_duplicate_url", url=url, key=key)
+            log_event("json_video_duplicate_url", url=candidates[0], key=key, candidates=len(candidates))
             return
         downloaded_video_keys.add(key)
-    download_claimed_video_url(url, source_url, "product_json", key)
+
+    for index, url in enumerate(candidates):
+        if download_video_url(url, source_url, "product_json", request_headers):
+            if index > 0:
+                log_event("json_video_fallback_succeeded", key=key, index=index, url=url)
+            return
+
+    log_event("json_video_candidates_failed", key=key, candidates=len(candidates), source_url=source_url)
+    with downloaded_video_keys_lock:
+        downloaded_video_keys.discard(key)
+
+
+def save_json_embedded_video(
+    url: str,
+    source_url: str,
+    request_headers: dict[str, str] | None = None,
+):
+    save_json_embedded_video_candidates([url], source_url, request_headers)
 
 
 def handle_json_images(flow: http.HTTPFlow):
@@ -765,25 +954,46 @@ def handle_json_images(flow: http.HTTPFlow):
         return
     if urls:
         log_event("json_image_urls_found", count=len(urls), sample=urls[:5], url=flow.request.url)
-    for url in urls[:80]:
-        threading.Thread(
-            target=save_json_embedded_image,
-            args=(url, flow.request.url),
-            daemon=True,
-        ).start()
+    image_headers = forwarded_request_headers(
+        flow,
+        "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    )
+    for url in limited_items(urls, MAX_JSON_IMAGE_URLS):
+        submit_download_task(save_json_embedded_image, url, flow.request.url, image_headers)
     if video_urls:
+        grouped_video_urls: dict[str, list[str]] = {}
+        for url in video_urls:
+            grouped_video_urls.setdefault(canonical_video_key(url), []).append(url)
+        video_groups = sorted(
+            grouped_video_urls.values(),
+            key=lambda candidates: max(video_candidate_score(url) for url in candidates),
+            reverse=True,
+        )
         log_event(
             "json_video_urls_found",
             count=len(video_urls),
+            groups=len(grouped_video_urls),
             sample=video_urls[:5],
             url=flow.request.url,
         )
-    for url in video_urls[:30]:
-        threading.Thread(
-            target=save_json_embedded_video,
-            args=(url, flow.request.url),
-            daemon=True,
-        ).start()
+        if len(video_urls) != len(grouped_video_urls):
+            log_event(
+                "json_video_candidates_grouped",
+                count=len(video_urls),
+                groups=len(grouped_video_urls),
+                url=flow.request.url,
+            )
+        video_headers = forwarded_request_headers(
+            flow,
+            "video/*,application/vnd.apple.mpegurl,application/x-mpegurl,*/*;q=0.8",
+        )
+        for candidates in limited_items(video_groups, MAX_JSON_VIDEO_GROUPS):
+            submit_download_task(
+                save_json_embedded_video_candidates,
+                candidates,
+                flow.request.url,
+                video_headers,
+            )
 
 
 def video_extension(flow: http.HTTPFlow) -> str:
