@@ -17,6 +17,38 @@ Windows:
 - Launch `mitmdump` through the current Python environment or a configured command.
 - Use PowerShell-friendly setup commands in the UI and docs.
 
+## Windows Setup Commands
+
+If `npm.cmd install` prints `'npm.cmd' is not recognized as an internal or external command`, Node.js is not installed or the current terminal has not reloaded PATH.
+
+On a new Windows machine, open PowerShell or Windows Terminal and run:
+
+```powershell
+# 1. Install Node.js LTS. This provides node, npm, and npm.cmd.
+winget install --id OpenJS.NodeJS.LTS -e
+
+# 2. Install Rust/Cargo for Tauri.
+winget install --id Rustlang.Rustup -e
+
+# 3. Install Visual Studio C++ Build Tools for Rust/Tauri on Windows.
+winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --quiet --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+
+# 4. Close this terminal, open a new terminal, then verify PATH.
+node --version
+npm --version
+cargo --version
+
+# 5. Install Python capture dependencies.
+py -m pip install mitmproxy Pillow pillow-heif
+
+# 6. Install project dependencies and start the app.
+cd D:\Dev\得物采集
+npm.cmd install
+npm.cmd run tauri dev
+```
+
+If `winget` is not available, install Node.js LTS from <https://nodejs.org/>, then close and reopen the terminal before running `npm.cmd`.
+
 macOS:
 
 - Run the Tauri desktop app.
