@@ -38,6 +38,7 @@ const defaultSettings: CaptureConfig = {
   jpegQuality: 95,
   hostKeywords: ["dewu", "poizon", "shihuo", "dewucdn", "dewuimg", "aliyuncs"],
   mitmdumpCommand: "mitmdump",
+  adbPath: "",
 };
 
 const defaultEasyToolSettings: EasyToolSettings = {
@@ -299,9 +300,15 @@ export default function App() {
     setAdbBusy(true);
     setNotice("");
     try {
-      const info = await api.detectMumuAdb();
-      setAdbInfo(info);
-      setNotice(info.adbPath ? `已找到 MuMu ADB：${info.adbPath}` : "没有找到 MuMu ADB，请确认 MuMu 已安装。");
+      const info = await api.detectMumuAdb(settings.adbPath);
+      const adbPath = settings.adbPath?.trim() || info.adbPath || "";
+      setAdbInfo({ ...info, adbPath: adbPath || undefined });
+      if (info.adbPath && info.adbPath !== settings.adbPath) {
+        const nextSettings = { ...settings, adbPath: info.adbPath };
+        setSettings(nextSettings);
+        saveSettings(nextSettings);
+      }
+      setNotice(adbPath ? `已找到 MuMu ADB：${adbPath}` : "没有找到 MuMu ADB，请在下方填写 adb.exe 完整路径。");
     } catch (error) {
       showError(error);
     } finally {
@@ -313,12 +320,16 @@ export default function App() {
     setAdbBusy(true);
     setNotice("");
     try {
-      const result = await api.setMumuWifiProxy(selectedIp, settings.port, adbInfo?.adbPath);
+      const adbPath = settings.adbPath?.trim() || adbInfo?.adbPath;
+      const result = await api.setMumuWifiProxy(selectedIp, settings.port, adbPath);
       setAdbInfo((current) => ({
         adbPath: result.adbPath,
         devices: [result.device],
         candidatePorts: current?.candidatePorts ?? [],
       }));
+      const nextSettings = { ...settings, adbPath: result.adbPath };
+      setSettings(nextSettings);
+      saveSettings(nextSettings);
       setLogs((current) => [
         ...current,
         { stream: "adb", line: `MuMu proxy set to ${result.proxy} on ${result.device}` },
@@ -335,7 +346,7 @@ export default function App() {
     setAdbBusy(true);
     setNotice("");
     try {
-      const result = await api.clearMumuWifiProxy(adbInfo?.adbPath);
+      const result = await api.clearMumuWifiProxy(settings.adbPath?.trim() || adbInfo?.adbPath);
       setLogs((current) => [...current, { stream: "adb", line: `MuMu proxy cleared on ${result.device}` }]);
       setNotice("已清除 MuMu Wi-Fi 代理。");
     } catch (error) {
@@ -552,9 +563,21 @@ export default function App() {
                 <div className="adb-box">
                   <div>
                     <strong>MuMu ADB 代理</strong>
-                    <span>{adbInfo?.adbPath ? `ADB：${adbInfo.adbPath}` : "自动查找 MuMu 自带 ADB"}</span>
+                    <span>{settings.adbPath || adbInfo?.adbPath ? `ADB：${settings.adbPath || adbInfo?.adbPath}` : "自动查找 MuMu 自带 ADB"}</span>
                     {adbInfo?.devices.length ? <span>设备：{adbInfo.devices.join(", ")}</span> : null}
                   </div>
+                  <label className="field">
+                    <span>ADB 路径</span>
+                    <input
+                      placeholder="例如 D:\\Software\\MuMuPlayer\\nx_device\\12.0\\shell\\adb.exe"
+                      value={settings.adbPath || ""}
+                      onChange={(event) => {
+                        const nextSettings = { ...settings, adbPath: event.target.value };
+                        setSettings(nextSettings);
+                        saveSettings(nextSettings);
+                      }}
+                    />
+                  </label>
                   <div className="adb-actions">
                     <button className="secondary" disabled={adbBusy} onClick={detectMumuAdb}>
                       <Search size={17} />

@@ -8,6 +8,7 @@ export type CaptureConfig = {
   jpegQuality: number;
   hostKeywords: string[];
   mitmdumpCommand?: string;
+  adbPath?: string;
 };
 
 export type CaptureStatus = {
@@ -137,11 +138,11 @@ export const api = {
   },
 
 
-  async detectMumuAdb(): Promise<AdbInfo> {
+  async detectMumuAdb(adbPath?: string): Promise<AdbInfo> {
     if (!isTauri()) {
       throw new Error("当前是浏览器预览模式，请在 Tauri 桌面窗口中检测 MuMu。");
     }
-    return invoke<AdbInfo>("detect_mumu_adb");
+    return invoke<AdbInfo>("detect_mumu_adb", { adbPath });
   },
 
   async setMumuWifiProxy(

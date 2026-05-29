@@ -551,8 +551,14 @@ done
 }
 
 #[tauri::command]
-fn detect_mumu_adb() -> Result<AdbInfo, String> {
-    let adb_path = find_mumu_adb().ok();
+fn detect_mumu_adb(adb_path: Option<String>) -> Result<AdbInfo, String> {
+    let adb_path = adb_path
+        .filter(|path| !path.trim().is_empty())
+        .and_then(|path| {
+            let path = PathBuf::from(path);
+            path.exists().then_some(path)
+        })
+        .or_else(|| find_mumu_adb().ok());
     let devices = if let Some(path) = adb_path.as_ref() {
         adb_devices(path).unwrap_or_default()
     } else {
@@ -1054,19 +1060,41 @@ fn mumu_roots() -> Vec<PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
-        roots.extend([
-            PathBuf::from(r"D:\Software\MuMuPlayer"),
-            PathBuf::from(r"C:\Program Files\MuMuPlayer"),
-            PathBuf::from(r"C:\Program Files (x86)\MuMuPlayer"),
-            PathBuf::from(r"C:\Program Files\Netease\MuMuPlayer"),
-            PathBuf::from(r"C:\Program Files (x86)\Netease\MuMuPlayer"),
-        ]);
-
-        if let Ok(program_files) = env::var("ProgramFiles") {
-            roots.push(PathBuf::from(program_files).join("MuMuPlayer"));
+        for path in [
+            r"D:\Software\MuMuPlayer",
+            r"D:\Program Files\MuMuPlayer",
+            r"C:\Program Files\MuMuPlayer",
+            r"C:\Program Files\MuMu Player",
+            r"C:\Program Files (x86)\MuMuPlayer",
+            r"C:\Program Files (x86)\MuMu Player",
+            r"C:\Program Files\Netease\MuMuPlayer",
+            r"C:\Program Files\Netease\MuMu Player",
+            r"C:\Program Files (x86)\Netease\MuMuPlayer",
+            r"C:\Program Files (x86)\Netease\MuMu Player",
+            r"C:\Program Files\Netease\MuMuPlayerGlobal-12.0",
+            r"C:\Program Files (x86)\Netease\MuMuPlayerGlobal-12.0",
+        ] {
+            push_unique_path(&mut roots, PathBuf::from(path));
         }
-        if let Ok(program_files_x86) = env::var("ProgramFiles(x86)") {
-            roots.push(PathBuf::from(program_files_x86).join("MuMuPlayer"));
+
+        for var in [
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramW6432",
+            "LOCALAPPDATA",
+            "APPDATA",
+            "ProgramData",
+        ] {
+            if let Ok(base) = env::var(var) {
+                add_windows_mumu_root_variants(&mut roots, Path::new(&base));
+                collect_windows_mumu_roots(Path::new(&base), &mut roots);
+            }
+        }
+
+        for drive in ["C:\\", "D:\\", "E:\\"] {
+            let base = Path::new(drive);
+            add_windows_mumu_root_variants(&mut roots, base);
+            collect_windows_mumu_roots(base, &mut roots);
         }
     }
 
@@ -1097,6 +1125,65 @@ fn mumu_roots() -> Vec<PathBuf> {
         }
     }
     roots
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|item| item == &path) {
+        paths.push(path);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn add_windows_mumu_root_variants(roots: &mut Vec<PathBuf>, base: &Path) {
+    for relative in [
+        "MuMuPlayer",
+        "MuMu Player",
+        "Netease/MuMuPlayer",
+        "Netease/MuMu Player",
+        "Netease/MuMuPlayerGlobal-12.0",
+        "Netease/MuMu Player 12",
+        "Nemu",
+        "NemuPlayer",
+    ] {
+        push_unique_path(roots, base.join(relative));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn collect_windows_mumu_roots(folder: &Path, roots: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        if path.is_dir()
+            && (lower.contains("mumu") || lower.contains("netease") || lower.contains("nemu"))
+        {
+            push_unique_path(roots, path.clone());
+            let Ok(children) = fs::read_dir(&path) else {
+                continue;
+            };
+            for child in children.flatten() {
+                let child_path = child.path();
+                let Some(child_name) = child_path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let child_lower = child_name.to_ascii_lowercase();
+                if child_path.is_dir()
+                    && (child_lower.contains("mumu")
+                        || child_lower.contains("netease")
+                        || child_lower.contains("nemu")
+                        || child_lower.starts_with("nx_"))
+                {
+                    push_unique_path(roots, child_path);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1286,7 +1373,10 @@ where
                     .get("error")
                     .and_then(|error| error.as_str())
                     .unwrap_or("unexpected response");
-                let path = value.get("path").and_then(|path| path.as_str()).unwrap_or("");
+                let path = value
+                    .get("path")
+                    .and_then(|path| path.as_str())
+                    .unwrap_or("");
                 if server_status == "404" {
                     return Err(format!(
                         "{context}: EasyTool endpoint not found (HTTP 404). Restart EasyTool backend or check EasyTool address. Path: {path}"
