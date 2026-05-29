@@ -13,6 +13,12 @@ use std::{
 };
 use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager, State};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 struct CaptureProcess {
     child: Child,
 }
@@ -197,6 +203,7 @@ fn start_capture(
         .env("DEWU_HOST_KEYWORDS", config.host_keywords.join(","))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    hide_command_window(&mut command);
 
     let mut child = command
         .spawn()
@@ -373,7 +380,10 @@ name = "mitmdump.exe" if __import__("os").name == "nt" else "mitmdump"
 print(pathlib.Path(sysconfig.get_path("scripts")) / name)
 "#;
     for python in python_launchers() {
-        let Ok(output) = Command::new(python).args(["-c", code]).output() else {
+        let mut command = Command::new(python);
+        command.args(["-c", code]);
+        hide_command_window(&mut command);
+        let Ok(output) = command.output() else {
             continue;
         };
         if !output.status.success() {
@@ -479,14 +489,16 @@ foreach ($target in $targets) {{
 }}
 "#
     );
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ])
+    let mut command = Command::new("powershell");
+    command.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &script,
+    ]);
+    hide_command_window(&mut command);
+    let output = command
         .output()
         .map_err(|error| format!("failed to inspect stale capture process: {error}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1031,7 +1043,10 @@ fn find_mumu_adb() -> Result<PathBuf, String> {
     }
 
     #[cfg(target_os = "windows")]
-    if let Ok(output) = Command::new("where.exe").arg("adb").output() {
+    let mut command = Command::new("where.exe");
+    command.arg("adb");
+    hide_command_window(&mut command);
+    if let Ok(output) = command.output() {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             candidates.extend(stdout.lines().map(|line| PathBuf::from(line.trim())));
@@ -1285,8 +1300,10 @@ fn adb_devices(adb: &Path) -> Result<Vec<String>, String> {
 }
 
 fn run_adb(adb: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(adb)
-        .args(args)
+    let mut command = Command::new(adb);
+    command.args(args);
+    hide_command_window(&mut command);
+    let output = command
         .output()
         .map_err(|error| format!("failed to run adb: {error}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1295,6 +1312,18 @@ fn run_adb(adb: &Path, args: &[&str]) -> Result<String, String> {
         Ok(format!("{stdout}{stderr}"))
     } else {
         Err(format!("adb failed: {stdout}{stderr}"))
+    }
+}
+
+fn hide_command_window(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = command;
     }
 }
 
