@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+
+# Frontend build output
+dist/
+
+# Rust/Tauri build output
+.cargo/
+src-tauri/gen/
+src-tauri/target/
+target/
+
+# Local runtime output
+images/
+videos/
+clipboard_uploads/
+debug-out/
+debug-out2/
+product_debug/
+src-tauri/images/
+src-tauri/videos/
+src-tauri/product_debug/
+
+# Logs
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local certificates and proxy state
+mitmproxy-ca-cert.*
+
+# Debug screenshots / captures
+debug_*.png
+dewu_screen*.png
+dewu_after_*.png
+src-tauri/dewu_screen*.png
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
