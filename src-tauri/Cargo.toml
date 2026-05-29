@@ -1,6 +1,6 @@
 [package]
 name = "dewu-capture-app"
-version = "0.1.3"
+version = "0.1.4"
 description = "MuMu-based Dewu media capture desktop app"
 authors = ["Dewu Capture"]
 edition = "2021"
