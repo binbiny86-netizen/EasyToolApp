@@ -11,7 +11,7 @@ use std::{
     thread,
     time::{Duration, SystemTime},
 };
-use tauri::{AppHandle, Emitter, State};
+use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager, State};
 
 struct CaptureProcess {
     child: Child,
@@ -169,8 +169,8 @@ fn start_capture(
         );
     }
 
-    let script_path = sidecar_script_path()?;
-    let output_root = resolve_output_root(&config.output_root)?;
+    let script_path = sidecar_script_path(&app)?;
+    let output_root = resolve_output_root(&app, &config.output_root)?;
     fs::create_dir_all(output_root.join("images"))
         .map_err(|error| format!("failed to create images directory: {error}"))?;
     fs::create_dir_all(output_root.join("videos"))
@@ -256,8 +256,8 @@ fn get_local_ips() -> Vec<String> {
 }
 
 #[tauri::command]
-fn list_media(output_root: String) -> Result<MediaList, String> {
-    let root = resolve_output_root(&output_root)?;
+fn list_media(app: AppHandle, output_root: String) -> Result<MediaList, String> {
+    let root = resolve_output_root(&app, &output_root)?;
     let mut images = read_media_dir(&root.join("images"), "image")?;
     let mut videos = read_media_dir(&root.join("videos"), "video")?;
     images.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
@@ -300,8 +300,8 @@ fn read_media_data_url(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn clear_media(output_root: String, kind: String) -> Result<(), String> {
-    let output_root = resolve_output_root(&output_root)?;
+fn clear_media(app: AppHandle, output_root: String, kind: String) -> Result<(), String> {
+    let output_root = resolve_output_root(&app, &output_root)?;
     let folder = match kind.as_str() {
         "image" => "images",
         "video" => "videos",
@@ -757,14 +757,20 @@ where
     });
 }
 
-fn sidecar_script_path() -> Result<PathBuf, String> {
+fn sidecar_script_path(app: &AppHandle) -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|error| format!("failed to read cwd: {error}"))?;
-    let candidates = [
+    let mut candidates = vec![
         cwd.join("dewu_image_saver.py"),
         cwd.parent()
             .map(|parent| parent.join("dewu_image_saver.py"))
             .unwrap_or_else(|| cwd.join("dewu_image_saver.py")),
     ];
+    if let Ok(resource_path) = app
+        .path()
+        .resolve("dewu_image_saver.py", BaseDirectory::Resource)
+    {
+        candidates.push(resource_path);
+    }
 
     candidates
         .into_iter()
@@ -772,17 +778,34 @@ fn sidecar_script_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "dewu_image_saver.py was not found".to_string())
 }
 
-fn resolve_output_root(output_root: &str) -> Result<PathBuf, String> {
+fn resolve_output_root(app: &AppHandle, output_root: &str) -> Result<PathBuf, String> {
     let value = output_root.trim();
     let path = if value.is_empty() || value == "." {
-        sidecar_script_path()?
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| "failed to resolve output directory".to_string())?
+        default_output_root(app)?
     } else {
         PathBuf::from(value)
     };
     Ok(path.canonicalize().unwrap_or(path))
+}
+
+fn default_output_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let cwd = std::env::current_dir().map_err(|error| format!("failed to read cwd: {error}"))?;
+    for candidate in [
+        cwd.join("dewu_image_saver.py"),
+        cwd.parent()
+            .map(|parent| parent.join("dewu_image_saver.py"))
+            .unwrap_or_else(|| cwd.join("dewu_image_saver.py")),
+    ] {
+        if candidate.exists() {
+            return candidate
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| "failed to resolve output directory".to_string());
+        }
+    }
+    app.path()
+        .app_data_dir()
+        .map_err(|error| format!("failed to resolve app data directory: {error}"))
 }
 
 fn read_media_dir(path: &Path, kind: &str) -> Result<Vec<MediaFile>, String> {
